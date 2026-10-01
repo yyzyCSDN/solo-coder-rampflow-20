@@ -130,9 +130,7 @@ class TurnaroundPlanner:
         return TurnPlan(flight_id,anchor,departure,runs,generation,critical,slack)
 
     def commit(self, plan: TurnPlan) -> Decision:
-        if self.ledger.generation != plan.resource_generation:
-            self.plans[plan.flight_id] = plan
-            return Decision(True, "reconciled", "stale plan accepted after generation refresh", {"critical_path": plan.critical_path})
+        stale=self.ledger.generation != plan.resource_generation
         staged=[]
         for run in plan.runs.values():
             for rid in run.resources:
@@ -143,6 +141,8 @@ class TurnaroundPlanner:
         except (ConflictError,StaleGeneration) as e:
             return Decision(False,"resource-conflict",str(e))
         self.plans[plan.flight_id]=plan
+        if stale:
+            return Decision(True,"reconciled","stale plan revalidated against current reservations",{"critical_path":plan.critical_path})
         return Decision(True,"ok","turnaround plan committed",{"critical_path":plan.critical_path})
 
     def transition(self,flight_id:str,task_id:str,new_state:ServiceState,actual:Window|None=None,blocked_reason:str|None=None)->TaskRun:

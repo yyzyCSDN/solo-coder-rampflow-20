@@ -57,6 +57,39 @@ class WorkflowControlTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(control.stream.head, 0)
 
+    def test_turnaround_dispatch_failure_publishes_nothing(self):
+        control = RampWorkflowControl()
+
+        def rejected():
+            raise RuntimeError("vehicle reservation lost")
+
+        with self.assertRaises(RuntimeError):
+            control.commit_turnaround_dispatch("op-d1", "F1", self.at, rejected)
+        self.assertEqual(control.stream.head, 0)
+        self.assertEqual(control.receipts, {})
+
+    def test_turnaround_dispatch_requirements_gate_and_replay(self):
+        control = RampWorkflowControl()
+        calls = []
+        denied = Decision(False, "unit-stale", "vehicle already committed")
+        with self.assertRaises(WorkflowRejected):
+            control.commit_turnaround_dispatch(
+                "op-d2", "F1", self.at,
+                lambda: calls.append("committed"), requirements=(denied,),
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(control.stream.head, 0)
+
+        first = control.commit_turnaround_dispatch(
+            "op-d3", "F1", self.at, lambda: calls.append("commit") or "ok",
+        )
+        second = control.commit_turnaround_dispatch(
+            "op-d3", "F1", self.at, lambda: calls.append("duplicate"),
+        )
+        self.assertIs(first, second)
+        self.assertEqual(calls, ["commit"])
+        self.assertEqual(control.stream.head, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

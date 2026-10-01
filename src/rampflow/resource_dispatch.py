@@ -102,7 +102,7 @@ class ResourceDispatcher:
             return None
         distance = self.graph.distance(resource.location, request.location)
         travel_seconds = int(distance / resource.speed_m_s)
-        depart = request.earliest - timedelta(seconds=travel_seconds)
+        depart = max(request.earliest - timedelta(seconds=travel_seconds), resource.available_at)
         arrive = depart + timedelta(seconds=travel_seconds)
         start = max(arrive, request.earliest)
         service = Window(start, start + timedelta(minutes=request.service_min))

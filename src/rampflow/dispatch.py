@@ -44,7 +44,7 @@ class Dispatcher:
         self.units={u.unit_id:u for u in units}
         self.distance_km=distance_km
         self._use:dict[str,list[Window]]={u:[] for u in self.units}
-        self._location={u.unit_id:u.location for u in self.units}
+        self._location={u.unit_id:u.location for u in self.units.values()}
         self.assignments:dict[str,DispatchAssignment]={}
 
     def _topological(self,jobs:Mapping[str,DispatchJob])->tuple[str,...]:
@@ -115,10 +115,14 @@ class Dispatcher:
     def commit_batch(self,assignments:Iterable[DispatchAssignment],jobs:Mapping[str,DispatchJob])->Decision:
         staged=[]
         for a in assignments:
+            if a.unit_id not in self._use:return Decision(False,"unit-unknown","dispatch unit not managed",{"unit":a.unit_id})
+            job=jobs.get(a.job_id)
+            if job is None:return Decision(False,"job-unknown","dispatch job not provided",{"job":a.job_id})
             occupied=a.service if a.travel is None else Window(a.travel.start,a.service.end)
-            if any(w.overlaps(occupied) for w in self._use[a.unit_id]):
+            pending=[w for prior,w,_ in staged if prior.unit_id==a.unit_id]
+            if any(w.overlaps(occupied) for w in self._use[a.unit_id]+pending):
                 return Decision(False,"unit-stale","dispatch unit availability changed",{"unit":a.unit_id})
-            staged.append((a,occupied))
-        for a,occupied in staged:
-            self._use[a.unit_id].append(occupied);self._location[a.unit_id]=jobs[a.job_id].location;self.assignments[a.job_id]=a
+            staged.append((a,occupied,job.location))
+        for a,occupied,location in staged:
+            self._use[a.unit_id].append(occupied);self._location[a.unit_id]=location;self.assignments[a.job_id]=a
         return Decision(True,"ok","dispatch batch committed",{"count":len(staged)})

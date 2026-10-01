@@ -10,8 +10,11 @@ from rampflow.fuel_accounting import FuelTank, FuelLedger
 from rampflow.crew_duty_control import CrewMember, CrewDutyController, DutySegment
 from rampflow.operational_policy import PolicyRule, PolicyContext, PolicyEngine, Effect
 from rampflow.service_windows import ServiceWindowRule, ServiceWindowPlanner
-from rampflow.resource_dispatch import TravelGraph, MobileResource, ResourceDispatcher, DispatchRequest
+from rampflow.resource_dispatch import TravelGraph, MobileResource, ResourceDispatcher, DispatchRequest, DispatchError
 from rampflow.stand_orchestration import StandProfile, StandDemand, StandOrchestrator
+from rampflow.turnaround import TurnaroundPlanner, TurnTask, ResourceRequirement
+from rampflow.dispatch import Dispatcher, DispatchUnit, DispatchJob, DispatchAssignment
+from rampflow.models import TaskSpec
 
 UTC=timezone.utc
 D=lambda h,m=0: datetime(2026,1,1,h,m,tzinfo=UTC)
@@ -78,5 +81,72 @@ class PublicTests(unittest.TestCase):
         o.commit(a)
         with self.assertRaises(Exception):
             o.plan(StandDemand('G',Window(D(10,30),D(11,30)),35,False))
+
+    def test_dispatch_waits_for_resource_readiness(self):
+        g=TravelGraph();g.add('A','B',600)
+        d=ResourceDispatcher([MobileResource('R','bus',frozenset(),'A',D(10,30),10)],g)
+        plan=d.plan(DispatchRequest('Q','bus',None,'B',D(10),5,D(11)))
+        self.assertGreaterEqual(plan.depart_at,D(10,30))
+        d.commit(plan)
+        self.assertEqual(d.state('R').location,'B')
+
+    def test_dispatch_race_loser_rejected_without_residue(self):
+        g=TravelGraph();g.add('A','B',600);g.add('A','C',600)
+        d=ResourceDispatcher([MobileResource('R','bus',frozenset(),'A',D(9),10)],g)
+        p1=d.plan(DispatchRequest('Q1','bus',None,'B',D(10),5,D(11)))
+        p2=d.plan(DispatchRequest('Q2','bus',None,'C',D(10),5,D(11)))
+        d.commit(p1)
+        with self.assertRaises(DispatchError):
+            d.commit(p2)
+        self.assertEqual(d.state('R').location,'B')
+        self.assertNotIn('Q2',d.dispatches)
+
+    def test_turnaround_stale_plan_conflict_rejected(self):
+        p=TurnaroundPlanner({'bus':['V1']})
+        task=TurnTask(TaskSpec('tow',30),requirements=(ResourceRequirement('bus'),))
+        plan1=p.plan('F1',[task],D(10),D(12))
+        plan2=p.plan('F2',[task],D(10),D(12))
+        self.assertTrue(p.commit(plan1).accepted)
+        denied=p.commit(plan2)
+        self.assertFalse(denied.accepted)
+        self.assertNotIn('F2',p.plans)
+        self.assertEqual(len(p.ledger.reservations('V1')),1)
+
+    def test_turnaround_stale_plan_revalidated_when_fits(self):
+        p=TurnaroundPlanner({'bus':['V1']})
+        early=TurnTask(TaskSpec('tow',30),requirements=(ResourceRequirement('bus'),))
+        late=TurnTask(TaskSpec('load',30,earliest_offset_min=60),requirements=(ResourceRequirement('bus'),))
+        plan1=p.plan('F1',[early],D(10),D(12))
+        plan2=p.plan('F2',[late],D(10),D(12))
+        self.assertTrue(p.commit(plan1).accepted)
+        reconciled=p.commit(plan2)
+        self.assertTrue(reconciled.accepted)
+        self.assertEqual(reconciled.code,'reconciled')
+        self.assertEqual(len(p.ledger.reservations('V1')),2)
+
+    def _unit_dispatcher(self):
+        u=DispatchUnit('U','bus','A',frozenset(),30.0,Window(D(8),D(20)))
+        return Dispatcher([u],lambda a,b:0.0)
+
+    def test_commit_batch_rejects_intra_batch_overlap(self):
+        d=self._unit_dispatcher()
+        j1=DispatchJob('J1','bus','A',D(10),D(12),30)
+        j2=DispatchJob('J2','bus','A',D(10),D(12),30)
+        a1=DispatchAssignment('J1','U',None,Window(D(10),D(10,30)),0.0,1.0)
+        a2=DispatchAssignment('J2','U',None,Window(D(10,15),D(10,45)),0.0,1.0)
+        dec=d.commit_batch([a1,a2],{'J1':j1,'J2':j2})
+        self.assertFalse(dec.accepted)
+        self.assertEqual(d.assignments,{})
+        self.assertEqual(d._use['U'],[])
+
+    def test_commit_batch_unknown_job_leaves_no_occupation(self):
+        d=self._unit_dispatcher()
+        j1=DispatchJob('J1','bus','A',D(10),D(12),30)
+        a1=DispatchAssignment('J1','U',None,Window(D(10),D(10,30)),0.0,1.0)
+        a2=DispatchAssignment('JX','U',None,Window(D(11),D(11,30)),0.0,1.0)
+        dec=d.commit_batch([a1,a2],{'J1':j1})
+        self.assertFalse(dec.accepted)
+        self.assertEqual(d.assignments,{})
+        self.assertEqual(d._use['U'],[])
 
 if __name__=='__main__': unittest.main()
