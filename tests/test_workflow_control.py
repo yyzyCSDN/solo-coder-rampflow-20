@@ -57,6 +57,46 @@ class WorkflowControlTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(control.stream.head, 0)
 
+    def test_turnaround_dispatch_commits_before_publishing(self):
+        control = RampWorkflowControl()
+        calls = []
+
+        receipt = control.commit_turnaround_dispatch(
+            "op-d1", "F1", self.at, lambda: calls.append("commit") or "ok"
+        )
+        self.assertEqual(calls, ["commit"])
+        self.assertEqual(control.stream.head, 1)
+
+        replay = control.commit_turnaround_dispatch(
+            "op-d1", "F1", self.at, lambda: calls.append("duplicate")
+        )
+        self.assertIs(replay, receipt)
+        self.assertEqual(calls, ["commit"])
+        self.assertEqual(control.stream.head, 1)
+
+    def test_turnaround_dispatch_failure_publishes_nothing(self):
+        control = RampWorkflowControl()
+
+        def rejected():
+            raise RuntimeError("vehicle not ready")
+
+        with self.assertRaises(RuntimeError):
+            control.commit_turnaround_dispatch("op-d2", "F1", self.at, rejected)
+        self.assertEqual(control.stream.head, 0)
+        self.assertEqual(control.receipts, {})
+
+    def test_turnaround_dispatch_requires_accepted_requirements(self):
+        control = RampWorkflowControl()
+        calls = []
+        denied = Decision(False, "resource-conflict", "vehicle already occupied")
+        with self.assertRaises(WorkflowRejected):
+            control.commit_turnaround_dispatch(
+                "op-d3", "F1", self.at,
+                lambda: calls.append("commit"), requirements=(denied,),
+            )
+        self.assertEqual(calls, [])
+        self.assertEqual(control.stream.head, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

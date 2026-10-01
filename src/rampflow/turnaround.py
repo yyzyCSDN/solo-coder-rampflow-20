@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass,replace
+from dataclasses import dataclass,field,replace
 from datetime import datetime,timedelta
 from collections import defaultdict,deque
 from typing import Iterable,Mapping
@@ -28,6 +28,7 @@ class TurnPlan:
     resource_generation:int
     critical_path:tuple[str,...]
     slack_min:Mapping[str,int]
+    predecessors:Mapping[str,tuple[str,...]]=field(default_factory=dict)
 
 class TurnaroundPlanner:
     def __init__(self,resources:Mapping[str,Iterable[str]]):
@@ -127,30 +128,39 @@ class TurnaroundPlanner:
             completion[tid]=wnd.end
         if runs and max(r.planned.end for r in runs.values())>departure:raise RuntimeError("turnaround misses departure")
         critical,slack=self._critical(taskmap,order)
-        return TurnPlan(flight_id,anchor,departure,runs,generation,critical,slack)
+        predecessors={tid:tuple(sorted(taskmap[tid].spec.predecessors)) for tid in order}
+        return TurnPlan(flight_id,anchor,departure,runs,generation,critical,slack,predecessors)
 
-    def commit(self, plan: TurnPlan) -> Decision:
-        if self.ledger.generation != plan.resource_generation:
-            self.plans[plan.flight_id] = plan
-            return Decision(True, "reconciled", "stale plan accepted after generation refresh", {"critical_path": plan.critical_path})
+    def commit(self,plan:TurnPlan)->Decision:
+        if plan.flight_id in self.plans:return Decision(False,"duplicate","turnaround plan already committed")
+        if self.ledger.generation!=plan.resource_generation:
+            return Decision(False,"stale-generation","plan built on a stale resource snapshot; replan and resubmit")
         staged=[]
         for run in plan.runs.values():
             for rid in run.resources:
                 staged.append((rid,run.planned,f"{plan.flight_id}:{run.task_id}"))
         try:
-            if staged:
-                self.ledger.bulk_reserve(staged,self.ledger.generation)
+            if staged:self.ledger.bulk_reserve(staged,self.ledger.generation)
         except (ConflictError,StaleGeneration) as e:
             return Decision(False,"resource-conflict",str(e))
         self.plans[plan.flight_id]=plan
         return Decision(True,"ok","turnaround plan committed",{"critical_path":plan.critical_path})
 
+    def release(self,flight_id:str)->Decision:
+        plan=self.plans.pop(flight_id,None)
+        if plan is None:return Decision(False,"unknown-flight","no committed plan for flight")
+        wanted={f"{flight_id}:{tid}" for tid in plan.runs}
+        released=0
+        for rid in sorted({r for run in plan.runs.values() for r in run.resources}):
+            for held in self.ledger.reservations(rid):
+                if held.payload in wanted and self.ledger.release(held.token):released+=1
+        return Decision(True,"ok","turnaround plan released",{"released":released})
+
     def transition(self,flight_id:str,task_id:str,new_state:ServiceState,actual:Window|None=None,blocked_reason:str|None=None)->TaskRun:
         plan=self.plans[flight_id];run=plan.runs[task_id]
         if new_state in {ServiceState.READY,ServiceState.ACTIVE,ServiceState.COMPLETE}:
-            predecessors=[]
-            for other in plan.runs.values():
-                if other.task_id==task_id:continue
+            pending=sorted(p for p in plan.predecessors.get(task_id,()) if plan.runs[p].state!=ServiceState.COMPLETE)
+            if pending:raise RuntimeError(f"predecessor tasks not complete: {pending}")
             if new_state==ServiceState.ACTIVE:
                 for candidate in plan.runs.values():
                     if candidate.task_id==task_id:continue
